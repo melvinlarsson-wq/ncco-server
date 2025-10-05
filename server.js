@@ -9,17 +9,15 @@ const PORT = process.env.PORT || 10000;
 
 const ELEVEN_API_KEY  = process.env.ELEVEN_API_KEY;   // krävs
 const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;  // krävs
-const VONAGE_RATE     = parseInt(process.env.VONAGE_RATE || "16000", 10); // 16000 eller 24000
+const VONAGE_RATE     = parseInt(process.env.VONAGE_RATE || "24000", 10); // vi kör 24 kHz nu
 
 app.use(express.json());
 
-// --- Healthcheck ---
+// Healthcheck + (valfritt) eventlogg
 app.get("/", (_req, res) => res.status(200).send("ok"));
-
-// --- (valfritt) logga Vonage events till Render logs ---
 app.post("/event", (req, res) => { console.log("📟 Vonage event:", req.body); res.sendStatus(200); });
 
-// --- NCCO: talk -> connect(websocket) ---
+// NCCO: talk -> connect(websocket)
 app.get("/ncco", (req, res) => {
   const session = req.query.uuid || "no-session";
   res.json([
@@ -30,7 +28,7 @@ app.get("/ncco", (req, res) => {
         {
           type: "websocket",
           uri: `wss://${req.get("host")}/vonage-media?session=${encodeURIComponent(session)}`,
-          "content-type": `audio/l16;rate=${VONAGE_RATE}`,
+          "content-type": `audio/l16;rate=${VONAGE_RATE};channels=1`, // <-- channels=1
           headers: { "x-session": session }
         }
       ]
@@ -43,12 +41,10 @@ const wss = new WebSocketServer({ server, path: "/vonage-media" });
 
 // Helpers
 const bufToB64 = (buf) => Buffer.from(buf).toString("base64");
-
-// 20 ms tystnad @ VONAGE_RATE, 16-bit mono (LE)
 const SILENCE_20MS = Buffer.alloc(Math.round(VONAGE_RATE * 2 * 0.02));
 
-// 1s pip @440 Hz i 20ms-chunks (verifierar att ljud->Vonage funkar)
-async function playBeep(ws, sr = VONAGE_RATE, ms = 800, freq = 440) {
+// 1s pip @440 Hz (20 ms-chunks)
+async function playBeep(ws, sr = VONAGE_RATE, ms = 600, freq = 440) {
   const samplesPerChunk = Math.round(sr * 0.02);
   const totalChunks = Math.ceil(ms / 20);
   let t = 0;
@@ -56,7 +52,7 @@ async function playBeep(ws, sr = VONAGE_RATE, ms = 800, freq = 440) {
     const buf = Buffer.alloc(samplesPerChunk * 2);
     for (let n = 0; n < samplesPerChunk; n++) {
       const s = Math.sin(2 * Math.PI * freq * (t / sr));
-      const val = Math.max(-1, Math.min(1, s)) * 7000; // lite högre volym
+      const val = Math.max(-1, Math.min(1, s)) * 9000;
       buf.writeInt16LE(val | 0, n * 2);
       t++;
     }
@@ -65,13 +61,13 @@ async function playBeep(ws, sr = VONAGE_RATE, ms = 800, freq = 440) {
   }
 }
 
-// ---- Gain (höjer volymen rejält utan att spräcka) ----
+// RMS + gain
 function rmsInt16LE(buf) {
   let sum = 0, n = buf.length / 2;
   for (let i = 0; i < buf.length; i += 2) { const v = buf.readInt16LE(i); sum += v * v; }
   return Math.sqrt(sum / Math.max(1, n)) / 32768;
 }
-function applyGain(frameLE, targetRms = 0.35, maxGain = 80) {
+function applyGain(frameLE, targetRms = 0.45, maxGain = 80) {
   const current = Math.max(1e-6, rmsInt16LE(frameLE));
   const gain = Math.max(1, Math.min(maxGain, targetRms / current));
   const out = Buffer.from(frameLE);
@@ -83,11 +79,12 @@ function applyGain(frameLE, targetRms = 0.35, maxGain = 80) {
   return out;
 }
 
-// ---- MP3 -> FFmpeg -> PCM -> 20ms frames -> Vonage ----
+// MP3 → FFmpeg → PCM → 20ms-frames → Vonage
 async function streamMp3ThroughFfmpegToVonage(ws, mp3Readable, rate) {
   const ff = spawn("ffmpeg", [
     "-hide_banner", "-loglevel", "error",
     "-i", "pipe:0",
+    "-af", "volume=12",       // <-- extra boost redan i ffmpeg
     "-ac", "1",
     "-ar", String(rate),
     "-f", "s16le",
@@ -97,7 +94,7 @@ async function streamMp3ThroughFfmpegToVonage(ws, mp3Readable, rate) {
   ff.stderr.on("data", d => console.error("ffmpeg:", d.toString().trim()));
   ff.on("close", code => console.log("ffmpeg closed:", code));
 
-  // Pumpa MP3 in i ffmpeg
+  // pumpa MP3 in
   (async () => {
     const iterIn = mp3Readable[Symbol.asyncIterator]
       ? mp3Readable
@@ -117,9 +114,9 @@ async function streamMp3ThroughFfmpegToVonage(ws, mp3Readable, rate) {
     ff.stdin.end();
   })().catch(e => console.error("ffmpeg stdin error:", e));
 
-  // Läs PCM från ffmpeg och skicka i 20ms-frames
+  // läs PCM och skicka i 20ms
   const FRAME_MS = 20;
-  const FRAME_BYTES = Math.round(rate * 2 * (FRAME_MS / 1000)); // 640 @16k, 960 @24k
+  const FRAME_BYTES = Math.round(rate * 2 * (FRAME_MS / 1000)); // 960 @ 24k
   let carry = Buffer.alloc(0);
   let framesSent = 0;
 
@@ -128,8 +125,7 @@ async function streamMp3ThroughFfmpegToVonage(ws, mp3Readable, rate) {
     while (carry.length >= FRAME_BYTES) {
       let frame = carry.subarray(0, FRAME_BYTES);
       carry = carry.subarray(FRAME_BYTES);
-
-      frame = applyGain(frame, 0.35, 80); // höj nivå
+      frame = applyGain(frame, 0.45, 80);
       ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(frame) } }));
       framesSent++;
       await new Promise(r => setTimeout(r, FRAME_MS));
@@ -138,7 +134,7 @@ async function streamMp3ThroughFfmpegToVonage(ws, mp3Readable, rate) {
   if (carry.length > 0) {
     let pad = Buffer.alloc(FRAME_BYTES);
     carry.copy(pad);
-    pad = applyGain(pad, 0.35, 80);
+    pad = applyGain(pad, 0.45, 80);
     ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(pad) } }));
     framesSent++;
   }
@@ -150,10 +146,8 @@ wss.on("connection", async (ws, req) => {
   const sessionId = url.searchParams.get("session") || req.headers["x-session"] || "no-session";
   console.log("📞 WS connected:", sessionId);
 
-  // WS keepalive
+  // WS keepalive + tystnad
   const keepAlive = setInterval(() => { try { ws.send(JSON.stringify({ type: "ping" })); } catch {} }, 25000);
-
-  // Håll linan vid liv med tystnad tills vi spelar riktig audio
   let sendingSilence = true;
   const silenceTimer = setInterval(() => {
     if (sendingSilence && ws.readyState === ws.OPEN) {
@@ -161,11 +155,11 @@ wss.on("connection", async (ws, req) => {
     }
   }, 40);
 
-  // Pip (bekräfta ljud ut)
+  // pip
   await playBeep(ws).catch(e => console.error("Beep error:", e));
   console.log("✅ Beep sent");
 
-  // ElevenLabs → MP3-stream → FFmpeg → PCM → Vonage
+  // ElevenLabs → MP3 → FFmpeg → PCM
   try {
     if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) throw new Error("Missing ELEVEN_API_KEY or ELEVEN_VOICE_ID");
 
@@ -177,7 +171,9 @@ wss.on("connection", async (ws, req) => {
         "content-type": "application/json",
         "xi-api-key": ELEVEN_API_KEY
       },
-      body: JSON.stringify({ text: "Hej! Nu SKA du höra ElevenLabs-rösten via telefon." })
+      body: JSON.stringify({
+        text: "Hej! Nu ska du höra ElevenLabs-rösten klart och tydligt.",
+      })
     });
 
     if (!res.ok || !res.body) {
