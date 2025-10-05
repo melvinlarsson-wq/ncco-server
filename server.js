@@ -70,10 +70,9 @@ function rmsInt16LE(buf) {
   for (let i = 0; i < buf.length; i += 2) { const v = buf.readInt16LE(i); sum += v * v; }
   return Math.sqrt(sum / Math.max(1, n)) / 32768;
 }
-function applyGain(frameLE, targetRms = 0.12, maxGain = 12) {
-  // räkna RMS och räkna fram gain för att nå target
-  const current = rmsInt16LE(frameLE);
-  const gain = Math.max(1, Math.min(maxGain, targetRms / Math.max(current, 1e-6)));
+function applyGain(frameLE, targetRms = 0.25, maxGain = 48) {
+  const current = Math.max(1e-6, rmsInt16LE(frameLE));
+  const gain = Math.max(1, Math.min(maxGain, targetRms / current));
   const out = Buffer.from(frameLE);
   for (let i = 0; i < out.length; i += 2) {
     let v = out.readInt16LE(i);
@@ -81,6 +80,61 @@ function applyGain(frameLE, targetRms = 0.12, maxGain = 12) {
     out.writeInt16LE(v, i);
   }
   return { out, gain: Number(gain.toFixed(2)), current: Number(current.toFixed(4)) };
+}
+
+async function streamPcmToVonage(ws, readable, sampleRate) {
+  const FRAME_MS = 20;
+  const FRAME_BYTES = Math.round(sampleRate * 2 * (FRAME_MS / 1000)); // 640@16k / 960@24k
+  let carry = Buffer.alloc(0);
+  let framesSent = 0;
+  let first = true;
+  let useSwap = false;
+  let decided = false;
+
+  for await (const chunk of readable) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    carry = Buffer.concat([carry, buf]);
+
+    if (first) {
+      const head = carry.slice(0, 8).toString("hex");
+      console.log(`🧪 first-bytes=${head}`);
+      if (carry.length >= 44 && carry.slice(0,4).toString() === "RIFF") {
+        console.log("WAV header detected -> stripping 44 bytes");
+        carry = carry.subarray(44);
+      }
+      first = false;
+    }
+
+    while (carry.length >= FRAME_BYTES) {
+      let frame = carry.subarray(0, FRAME_BYTES);
+      carry = carry.subarray(FRAME_BYTES);
+
+      if (!decided) {
+        const rLE = rmsInt16LE(frame);
+        const rBE = rmsInt16LE(swap16(frame));
+        useSwap = rBE > rLE * 2 && rBE > 0.0005;
+        decided = true;
+        console.log(`🎛️ endian chosen: ${useSwap ? "BE->LE swap" : "LE"} (rLE=${rLE.toFixed(4)} rBE=${rBE.toFixed(4)})`);
+      }
+      if (useSwap) frame = swap16(frame);
+
+      const { out, gain, current } = applyGain(frame, 0.3, 64);
+      if (framesSent === 0) console.log(`🔊 first frame rms=${current} gain=${gain}x`);
+
+      ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(out) } }));
+      framesSent++;
+      await new Promise(r => setTimeout(r, FRAME_MS));
+    }
+  }
+
+  if (carry.length > 0) {
+    let pad = Buffer.alloc(Math.round(sampleRate * 2 * 0.02));
+    carry.copy(pad);
+    const { out } = applyGain(pad, 0.3, 64);
+    ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(out) } }));
+    framesSent++;
+  }
+  console.log(`🟢 stream done (framesSent=${framesSent})`);
 }
 
 wss.on("connection", async (ws, req) => {
@@ -103,82 +157,53 @@ wss.on("connection", async (ws, req) => {
   await playBeep(ws).catch(e => console.error("Beep error:", e));
   console.log("✅ Beep sent");
 
-  // ❷ ElevenLabs HTTP stream (PCM) -> 20ms frames, endian-auto + auto-gain
+  // ❷ ElevenLabs: prova först /stream (PCM). Om inte PCM -> prova fallback.
   try {
     if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) throw new Error("Missing ELEVEN_API_KEY or ELEVEN_VOICE_ID");
 
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream?output_format=pcm_${VONAGE_RATE}`;
-    const body = JSON.stringify({ text: "Hej! Nu borde du höra ElevenLabs rösten via telefon." });
+    const baseHeaders = {
+      "content-type": "application/json",
+      "xi-api-key": ELEVEN_API_KEY
+    };
 
-    const res = await fetch(url, {
+    // --- primary: /stream med PCM ---
+    let url1 = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream?output_format=pcm_${VONAGE_RATE}`;
+    let res = await fetch(url1, {
       method: "POST",
-      headers: {
-        "accept": `audio/x-pcm;bit=16;rate=${VONAGE_RATE}`,
-        "content-type": "application/json",
-        "xi-api-key": ELEVEN_API_KEY
-      },
-      body
+      headers: { ...baseHeaders, "accept": `audio/x-pcm;bit=16;rate=${VONAGE_RATE}` },
+      body: JSON.stringify({ text: "Hej! Nu borde du höra ElevenLabs rösten via telefon." })
     });
 
-    if (!res.ok || !res.body) {
-      const errText = await res.text().catch(() => "");
-      console.error("ElevenLabs HTTP stream failed", res.status, res.statusText, errText);
+    const ct1 = res.headers.get("content-type") || "";
+    console.log("ElevenLabs ct1:", ct1);
+
+    if (res.ok && res.body && ct1.includes("pcm")) {
+      sendingSilence = false;
+      await streamPcmToVonage(ws, res.body, VONAGE_RATE);
     } else {
-      const FRAME_MS = 20;
-      const FRAME_BYTES = Math.round(VONAGE_RATE * 2 * (FRAME_MS / 1000)); // 640@16k / 960@24k
-      let carry = Buffer.alloc(0);
-      let framesSent = 0;
-      let first = true;
-      let useSwap = false;
-      let decided = false;
+      const errText = await res.text().catch(() => "");
+      console.warn("Primary stream not PCM or failed → fallback. Status:", res.status, res.statusText, errText);
 
-      for await (const chunk of res.body) {
-        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        carry = Buffer.concat([carry, buf]);
+      // --- fallback: non-/stream endpoint med output_format=pcm_... ---
+      let url2 = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}?output_format=pcm_${VONAGE_RATE}`;
+      res = await fetch(url2, {
+        method: "POST",
+        headers: { ...baseHeaders, "accept": `audio/x-pcm;bit=16;rate=${VONAGE_RATE}` },
+        body: JSON.stringify({ text: "Hej! Nu borde du höra ElevenLabs rösten via telefon (fallback)." })
+      });
+      const ct2 = res.headers.get("content-type") || "";
+      console.log("ElevenLabs ct2:", ct2);
 
-        if (first && carry.length >= 44 && carry.slice(0,4).toString() === "RIFF") {
-          carry = carry.subarray(44); // om det råkar komma en WAV-header
-        }
-        first = false;
-
-        while (carry.length >= FRAME_BYTES) {
-          let frame = carry.subarray(0, FRAME_BYTES);
-          carry = carry.subarray(FRAME_BYTES);
-
-          // endian-detektering en gång
-          if (!decided) {
-            const rLE = rmsInt16LE(frame);
-            const rBE = rmsInt16LE(swap16(frame));
-            useSwap = rBE > rLE * 2 && rBE > 0.0005;
-            decided = true;
-            console.log(`🎛️ endian chosen: ${useSwap ? "BE->LE swap" : "LE"} (rLE=${rLE.toFixed(4)} rBE=${rBE.toFixed(4)})`);
-          }
-          if (useSwap) frame = swap16(frame);
-
-          // auto-gain till tydlig nivå
-          const { out, gain, current } = applyGain(frame, 0.18, 16); // lite högre target
-          if (framesSent === 0) console.log(`🔊 first frame rms=${current} gain=${gain}x`);
-
-          ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(out) } }));
-          framesSent++;
-          sendingSilence = false;
-          await new Promise(r => setTimeout(r, FRAME_MS));
-        }
+      if (res.ok && res.body && ct2.includes("pcm")) {
+        sendingSilence = false;
+        await streamPcmToVonage(ws, res.body, VONAGE_RATE);
+      } else {
+        const e2 = await res.text().catch(() => "");
+        console.error("Fallback also failed / not PCM", res.status, res.statusText, e2);
       }
-
-      if (carry.length > 0) {
-        let pad = Buffer.alloc(FRAME_BYTES);
-        carry.copy(pad);
-        if (decided && useSwap) pad = swap16(pad);
-        const { out } = applyGain(pad, 0.18, 16);
-        ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(out) } }));
-        framesSent++;
-      }
-
-      console.log(`🟢 ElevenLabs HTTP stream done (framesSent=${framesSent})`);
     }
   } catch (e) {
-    console.error("ElevenLabs HTTP error:", e);
+    console.error("ElevenLabs error:", e);
   }
 
   // Vonage ping/hangup
@@ -188,9 +213,4 @@ wss.on("connection", async (ws, req) => {
     if (m.type === "stop" || m.type === "hangup") { try { ws.close(); } catch {} }
   });
 
-  const clean = () => { clearInterval(keepAlive); clearInterval(silenceTimer); };
-  ws.on("close", clean);
-  ws.on("error", clean);
-});
-
-server.listen(PORT, () => console.log(`🚀 Listening on :${PORT}`));
+  const clean = () => { clearInterval(keepAlive); clearInterv
