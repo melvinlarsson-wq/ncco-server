@@ -1,17 +1,23 @@
 import express from "express";
 import http from "http";
 import fetch from "node-fetch";
-import WebSocket, { WebSocketServer } from "ws";
+import { WebSocketServer } from "ws";
+import { spawn } from "child_process";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-const ELEVEN_API_KEY  = process.env.ELEVEN_API_KEY;
-const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
+const ELEVEN_API_KEY  = process.env.ELEVEN_API_KEY;   // krävs
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;  // krävs
 const VONAGE_RATE     = parseInt(process.env.VONAGE_RATE || "16000", 10); // 16000 eller 24000
+
+app.use(express.json());
 
 // --- Healthcheck ---
 app.get("/", (_req, res) => res.status(200).send("ok"));
+
+// --- (valfritt) logga Vonage events till Render logs ---
+app.post("/event", (req, res) => { console.log("📟 Vonage event:", req.body); res.sendStatus(200); });
 
 // --- NCCO: talk -> connect(websocket) ---
 app.get("/ncco", (req, res) => {
@@ -50,7 +56,7 @@ async function playBeep(ws, sr = VONAGE_RATE, ms = 800, freq = 440) {
     const buf = Buffer.alloc(samplesPerChunk * 2);
     for (let n = 0; n < samplesPerChunk; n++) {
       const s = Math.sin(2 * Math.PI * freq * (t / sr));
-      const val = Math.max(-1, Math.min(1, s)) * 6000;
+      const val = Math.max(-1, Math.min(1, s)) * 7000; // lite högre volym
       buf.writeInt16LE(val | 0, n * 2);
       t++;
     }
@@ -59,18 +65,13 @@ async function playBeep(ws, sr = VONAGE_RATE, ms = 800, freq = 440) {
   }
 }
 
-// ---- Audio utils ----
-function swap16(buf) {
-  const out = Buffer.from(buf);
-  for (let i = 0; i < out.length; i += 2) { const b = out[i]; out[i] = out[i+1]; out[i+1] = b; }
-  return out;
-}
+// ---- Gain (höjer volymen rejält utan att spräcka) ----
 function rmsInt16LE(buf) {
   let sum = 0, n = buf.length / 2;
   for (let i = 0; i < buf.length; i += 2) { const v = buf.readInt16LE(i); sum += v * v; }
   return Math.sqrt(sum / Math.max(1, n)) / 32768;
 }
-function applyGain(frameLE, targetRms = 0.25, maxGain = 48) {
+function applyGain(frameLE, targetRms = 0.35, maxGain = 80) {
   const current = Math.max(1e-6, rmsInt16LE(frameLE));
   const gain = Math.max(1, Math.min(maxGain, targetRms / current));
   const out = Buffer.from(frameLE);
@@ -79,78 +80,69 @@ function applyGain(frameLE, targetRms = 0.25, maxGain = 48) {
     v = Math.max(-32768, Math.min(32767, Math.round(v * gain)));
     out.writeInt16LE(v, i);
   }
-  return { out, gain: Number(gain.toFixed(2)), current: Number(current.toFixed(4)) };
+  return out;
 }
 
-async function streamPcmToVonage(ws, readable, sampleRate) {
+// ---- MP3 -> FFmpeg -> PCM -> 20ms frames -> Vonage ----
+async function streamMp3ThroughFfmpegToVonage(ws, mp3Readable, rate) {
+  const ff = spawn("ffmpeg", [
+    "-hide_banner", "-loglevel", "error",
+    "-i", "pipe:0",
+    "-ac", "1",
+    "-ar", String(rate),
+    "-f", "s16le",
+    "pipe:1"
+  ]);
+
+  ff.stderr.on("data", d => console.error("ffmpeg:", d.toString().trim()));
+  ff.on("close", code => console.log("ffmpeg closed:", code));
+
+  // Pumpa MP3 in i ffmpeg
+  (async () => {
+    const iterIn = mp3Readable[Symbol.asyncIterator]
+      ? mp3Readable
+      : mp3Readable?.getReader?.() && {
+          async *[Symbol.asyncIterator]() {
+            const reader = mp3Readable.getReader();
+            try {
+              while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                yield Buffer.from(value);
+              }
+            } finally { reader.releaseLock(); }
+          }
+        };
+    for await (const chunk of iterIn) ff.stdin.write(chunk);
+    ff.stdin.end();
+  })().catch(e => console.error("ffmpeg stdin error:", e));
+
+  // Läs PCM från ffmpeg och skicka i 20ms-frames
   const FRAME_MS = 20;
-  const FRAME_BYTES = Math.round(sampleRate * 2 * (FRAME_MS / 1000)); // 640@16k / 960@24k
+  const FRAME_BYTES = Math.round(rate * 2 * (FRAME_MS / 1000)); // 640 @16k, 960 @24k
   let carry = Buffer.alloc(0);
   let framesSent = 0;
-  let first = true;
-  let useSwap = false;
-  let decided = false;
 
-  // node-fetch v3 ReadableStream -> async iterator
-  const iter = readable[Symbol.asyncIterator]
-    ? readable
-    : readable?.getReader?.() && {
-        async *[Symbol.asyncIterator]() {
-          const reader = readable.getReader();
-          try {
-            while (true) {
-              const { value, done } = await reader.read();
-              if (done) break;
-              yield Buffer.from(value);
-            }
-          } finally { reader.releaseLock(); }
-        }
-      };
-
-  for await (const chunk of iter) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    carry = Buffer.concat([carry, buf]);
-
-    if (first) {
-      const head = carry.slice(0, 8).toString("hex");
-      console.log(`🧪 first-bytes=${head}`);
-      if (carry.length >= 44 && carry.slice(0,4).toString() === "RIFF") {
-        console.log("WAV header detected -> stripping 44 bytes");
-        carry = carry.subarray(44);
-      }
-      first = false;
-    }
-
+  for await (const chunk of ff.stdout) {
+    carry = Buffer.concat([carry, Buffer.from(chunk)]);
     while (carry.length >= FRAME_BYTES) {
       let frame = carry.subarray(0, FRAME_BYTES);
       carry = carry.subarray(FRAME_BYTES);
 
-      if (!decided) {
-        const rLE = rmsInt16LE(frame);
-        const rBE = rmsInt16LE(swap16(frame));
-        useSwap = rBE > rLE * 2 && rBE > 0.0005;
-        decided = true;
-        console.log(`🎛️ endian chosen: ${useSwap ? "BE->LE swap" : "LE"} (rLE=${rLE.toFixed(4)} rBE=${rBE.toFixed(4)})`);
-      }
-      if (useSwap) frame = swap16(frame);
-
-      const { out, gain, current } = applyGain(frame, 0.3, 64);
-      if (framesSent === 0) console.log(`🔊 first frame rms=${current} gain=${gain}x`);
-
-      ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(out) } }));
+      frame = applyGain(frame, 0.35, 80); // höj nivå
+      ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(frame) } }));
       framesSent++;
       await new Promise(r => setTimeout(r, FRAME_MS));
     }
   }
-
   if (carry.length > 0) {
-    let pad = Buffer.alloc(Math.round(sampleRate * 2 * 0.02));
+    let pad = Buffer.alloc(FRAME_BYTES);
     carry.copy(pad);
-    const { out } = applyGain(pad, 0.3, 64);
-    ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(out) } }));
+    pad = applyGain(pad, 0.35, 80);
+    ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(pad) } }));
     framesSent++;
   }
-  console.log(`🟢 stream done (framesSent=${framesSent})`);
+  console.log(`🟢 FFmpeg stream done (framesSent=${framesSent})`);
 }
 
 wss.on("connection", async (ws, req) => {
@@ -161,59 +153,39 @@ wss.on("connection", async (ws, req) => {
   // WS keepalive
   const keepAlive = setInterval(() => { try { ws.send(JSON.stringify({ type: "ping" })); } catch {} }, 25000);
 
-  // Skicka tystnad var 40 ms tills vi börjar spela riktig audio
+  // Håll linan vid liv med tystnad tills vi spelar riktig audio
   let sendingSilence = true;
   const silenceTimer = setInterval(() => {
-    if (sendingSilence && ws.readyState === WebSocket.OPEN) {
+    if (sendingSilence && ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(SILENCE_20MS) } }));
     }
   }, 40);
 
-  // ❶ Pip först
+  // Pip (bekräfta ljud ut)
   await playBeep(ws).catch(e => console.error("Beep error:", e));
   console.log("✅ Beep sent");
 
-  // ❷ ElevenLabs: /stream (PCM) → om inte PCM → fallback
+  // ElevenLabs → MP3-stream → FFmpeg → PCM → Vonage
   try {
     if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) throw new Error("Missing ELEVEN_API_KEY or ELEVEN_VOICE_ID");
 
-    const baseHeaders = { "content-type": "application/json", "xi-api-key": ELEVEN_API_KEY };
-
-    // Primary: /stream
-    let url1 = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream?output_format=pcm_${VONAGE_RATE}`;
-    let res = await fetch(url1, {
+    const ttsUrl = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream?optimize_streaming_latency=2`;
+    const res = await fetch(ttsUrl, {
       method: "POST",
-      headers: { ...baseHeaders, "accept": `audio/x-pcm;bit=16;rate=${VONAGE_RATE}` },
-      body: JSON.stringify({ text: "Hej! Nu borde du höra ElevenLabs rösten via telefon." })
+      headers: {
+        "accept": "audio/mpeg",
+        "content-type": "application/json",
+        "xi-api-key": ELEVEN_API_KEY
+      },
+      body: JSON.stringify({ text: "Hej! Nu SKA du höra ElevenLabs-rösten via telefon." })
     });
 
-    const ct1 = res.headers.get("content-type") || "";
-    console.log("ElevenLabs ct1:", ct1);
-
-    if (res.ok && res.body && ct1.includes("pcm")) {
-      sendingSilence = false;
-      await streamPcmToVonage(ws, res.body, VONAGE_RATE);
-    } else {
+    if (!res.ok || !res.body) {
       const errText = await res.text().catch(() => "");
-      console.warn("Primary not PCM / failed → fallback.", res.status, res.statusText, errText);
-
-      // Fallback: non-/stream endpoint
-      let url2 = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}?output_format=pcm_${VONAGE_RATE}`;
-      res = await fetch(url2, {
-        method: "POST",
-        headers: { ...baseHeaders, "accept": `audio/x-pcm;bit=16;rate=${VONAGE_RATE}` },
-        body: JSON.stringify({ text: "Hej! Nu borde du höra ElevenLabs rösten via telefon (fallback)." })
-      });
-      const ct2 = res.headers.get("content-type") || "";
-      console.log("ElevenLabs ct2:", ct2);
-
-      if (res.ok && res.body && ct2.includes("pcm")) {
-        sendingSilence = false;
-        await streamPcmToVonage(ws, res.body, VONAGE_RATE);
-      } else {
-        const e2 = await res.text().catch(() => "");
-        console.error("Fallback also failed / not PCM", res.status, res.statusText, e2);
-      }
+      console.error("ElevenLabs MP3 stream failed", res.status, res.statusText, errText);
+    } else {
+      sendingSilence = false;
+      await streamMp3ThroughFfmpegToVonage(ws, res.body, VONAGE_RATE);
     }
   } catch (e) {
     console.error("ElevenLabs error:", e);
