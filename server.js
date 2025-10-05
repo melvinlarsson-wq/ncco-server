@@ -1,7 +1,7 @@
 import express from "express";
 import http from "http";
 import fetch from "node-fetch";
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -91,7 +91,23 @@ async function streamPcmToVonage(ws, readable, sampleRate) {
   let useSwap = false;
   let decided = false;
 
-  for await (const chunk of readable) {
+  // node-fetch v3 ReadableStream -> async iterator
+  const iter = readable[Symbol.asyncIterator]
+    ? readable
+    : readable?.getReader?.() && {
+        async *[Symbol.asyncIterator]() {
+          const reader = readable.getReader();
+          try {
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              yield Buffer.from(value);
+            }
+          } finally { reader.releaseLock(); }
+        }
+      };
+
+  for await (const chunk of iter) {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     carry = Buffer.concat([carry, buf]);
 
@@ -148,7 +164,7 @@ wss.on("connection", async (ws, req) => {
   // Skicka tystnad var 40 ms tills vi börjar spela riktig audio
   let sendingSilence = true;
   const silenceTimer = setInterval(() => {
-    if (sendingSilence && ws.readyState === ws.OPEN) {
+    if (sendingSilence && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(SILENCE_20MS) } }));
     }
   }, 40);
@@ -157,16 +173,13 @@ wss.on("connection", async (ws, req) => {
   await playBeep(ws).catch(e => console.error("Beep error:", e));
   console.log("✅ Beep sent");
 
-  // ❷ ElevenLabs: prova först /stream (PCM). Om inte PCM -> prova fallback.
+  // ❷ ElevenLabs: /stream (PCM) → om inte PCM → fallback
   try {
     if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) throw new Error("Missing ELEVEN_API_KEY or ELEVEN_VOICE_ID");
 
-    const baseHeaders = {
-      "content-type": "application/json",
-      "xi-api-key": ELEVEN_API_KEY
-    };
+    const baseHeaders = { "content-type": "application/json", "xi-api-key": ELEVEN_API_KEY };
 
-    // --- primary: /stream med PCM ---
+    // Primary: /stream
     let url1 = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream?output_format=pcm_${VONAGE_RATE}`;
     let res = await fetch(url1, {
       method: "POST",
@@ -182,9 +195,9 @@ wss.on("connection", async (ws, req) => {
       await streamPcmToVonage(ws, res.body, VONAGE_RATE);
     } else {
       const errText = await res.text().catch(() => "");
-      console.warn("Primary stream not PCM or failed → fallback. Status:", res.status, res.statusText, errText);
+      console.warn("Primary not PCM / failed → fallback.", res.status, res.statusText, errText);
 
-      // --- fallback: non-/stream endpoint med output_format=pcm_... ---
+      // Fallback: non-/stream endpoint
       let url2 = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}?output_format=pcm_${VONAGE_RATE}`;
       res = await fetch(url2, {
         method: "POST",
@@ -213,4 +226,9 @@ wss.on("connection", async (ws, req) => {
     if (m.type === "stop" || m.type === "hangup") { try { ws.close(); } catch {} }
   });
 
-  const clean = () => { clearInterval(keepAlive); clearInterv
+  const clean = () => { clearInterval(keepAlive); clearInterval(silenceTimer); };
+  ws.on("close", clean);
+  ws.on("error", clean);
+});
+
+server.listen(PORT, () => console.log(`🚀 Listening on :${PORT}`));
