@@ -1,7 +1,7 @@
 import express from "express";
 import http from "http";
 import fetch from "node-fetch";
-import { WebSocketServer } from "ws";
+import { WebSocketServer, WebSocket } from "ws";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -72,7 +72,7 @@ wss.on("connection", async (ws, req) => {
   // Skicka tystnad var 40 ms tills vi börjar spela riktig audio
   let sendingSilence = true;
   const silenceTimer = setInterval(() => {
-    if (sendingSilence && ws.readyState === ws.OPEN) {
+    if (sendingSilence && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(SILENCE_20MS) } }));
     }
   }, 40);
@@ -89,7 +89,7 @@ wss.on("connection", async (ws, req) => {
 
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream?output_format=pcm_${VONAGE_RATE}`;
     const body = JSON.stringify({
-      text: "Hej! Nu borde du höra ElevenLabs-rösten via telefon. Perfekt!",
+      text: "Hej! Nu borde du höra ElevenLabs-rösten via telefon. Perfekt!"
     });
 
     const res = await fetch(url, {
@@ -106,33 +106,43 @@ wss.on("connection", async (ws, req) => {
       const errText = await res.text().catch(() => "");
       console.error("ElevenLabs HTTP stream failed", res.status, res.statusText, errText);
     } else {
-      sendingSilence = false;
+      sendingSilence = true; // håll tystnad tills första riktiga framen skickas
 
-      // Skiva till 20 ms frames så Vonage säkert spelar upp
       const FRAME_MS = 20;
-      const FRAME_BYTES = Math.round(VONAGE_RATE * 2 * (FRAME_MS / 1000)); // 640 @ 16k
+      const FRAME_BYTES = Math.round(VONAGE_RATE * 2 * (FRAME_MS / 1000)); // 640 @ 16k / 960 @ 24k
       let carry = Buffer.alloc(0);
+      let framesSent = 0;
+      let first = true;
 
       for await (const chunk of res.body) {
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         carry = Buffer.concat([carry, buf]);
 
+        // ev. WAV-header-skydd (om streamen av misstag innehåller "RIFF")
+        if (first && carry.length >= 44 && carry.slice(0,4).toString() === "RIFF") {
+          carry = carry.subarray(44);
+        }
+        first = false;
+
         while (carry.length >= FRAME_BYTES) {
           const frame = carry.subarray(0, FRAME_BYTES);
           carry = carry.subarray(FRAME_BYTES);
           ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(frame) } }));
+          framesSent++;
+          sendingSilence = false; // vi har nu skickat riktig audio
           await new Promise(r => setTimeout(r, FRAME_MS));
         }
       }
 
-      // Skicka ev. sista ofullständig bit (paddad med tystnad)
+      // sista ofullständiga biten (padda med tystnad)
       if (carry.length > 0) {
         const pad = Buffer.alloc(FRAME_BYTES);
         carry.copy(pad);
         ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(pad) } }));
+        framesSent++;
       }
 
-      console.log("🟢 ElevenLabs HTTP stream done");
+      console.log(`🟢 ElevenLabs HTTP stream done (framesSent=${framesSent})`);
     }
   } catch (e) {
     console.error("ElevenLabs HTTP error:", e);
