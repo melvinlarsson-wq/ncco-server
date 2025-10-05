@@ -1,14 +1,21 @@
 import express from "express";
 import http from "http";
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// NCCO som Vonage hämtar när någon ringer
+const ELEVEN_API_KEY = process.env.ELEVEN_API_KEY;
+const ELEVEN_VOICE_ID = process.env.ELEVEN_VOICE_ID;
+const VONAGE_RATE = process.env.VONAGE_RATE || "16000";
+
+// --- enkel healthcheck (bra för Render) ---
+app.get("/", (_req, res) => res.status(200).send("ok"));
+
+// --- NCCO: talk → connect (websocket) ---
 app.get("/ncco", (req, res) => {
   const session = req.query.uuid || "no-session";
-  const ncco = [
+  res.json([
     { action: "talk", text: "Hej! Kopplar dig till AI-receptionisten.", language: "sv-SE" },
     {
       action: "connect",
@@ -16,51 +23,80 @@ app.get("/ncco", (req, res) => {
         {
           type: "websocket",
           uri: `wss://${req.get("host")}/vonage-media?session=${encodeURIComponent(session)}`,
-          "content-type": "audio/l16;rate=16000",
+          "content-type": `audio/l16;rate=${VONAGE_RATE}`,
           headers: { "x-session": session }
         }
       ]
     }
-  ];
-  res.json(ncco);
+  ]);
 });
 
 const server = http.createServer(app);
-
-// WebSocket som tar emot/returnerar Vonage audio (JSON + base64)
 const wss = new WebSocketServer({ server, path: "/vonage-media" });
+
+const bufToB64 = (buf) => Buffer.from(buf).toString("base64");
 
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const sessionId = url.searchParams.get("session") || req.headers["x-session"] || "no-session";
   console.log("📞 WS connected:", sessionId);
 
-  // Keepalive så Vonage inte lägger på
+  // keepalive så Vonage inte lägger på
   const keepAlive = setInterval(() => {
     try { ws.send(JSON.stringify({ type: "ping" })); } catch {}
   }, 25000);
 
-  ws.on("message", (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+  // === ElevenLabs Realtime TTS ===
+  if (!ELEVEN_API_KEY || !ELEVEN_VOICE_ID) {
+    console.error("Missing ELEVEN_* env vars");
+  }
+  const elevenUrl =
+    `wss://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}/stream-input?optimize_streaming_latency=2`;
+  const ttsWS = new WebSocket(elevenUrl, { headers: { "xi-api-key": ELEVEN_API_KEY } });
 
-    switch (msg.type) {
-      case "ping":
-        ws.send(JSON.stringify({ type: "pong" }));
-        break;
-      case "media":
-        // EKO: skicka tillbaka samma audio (bevis på att stream funkar)
-        ws.send(JSON.stringify({ type: "media", media: { payload: msg.media.payload } }));
-        break;
-      case "stop":
-      case "hangup":
-        try { ws.close(); } catch {}
-        break;
+  ttsWS.on("open", () => {
+    console.log("🔊 ElevenLabs connected");
+    // Skicka en hälsning för att bevisa att TTS → Vonage funkar
+    ttsWS.send(JSON.stringify({
+      text: "Hej! Nu hör du ElevenLabs rösten. Vi kopplar logiken strax.",
+      try_trigger_generation: true
+    }));
+  });
+
+  // ElevenLabs → Vonage (audio)
+  ttsWS.on("message", (data, isBinary) => {
+    // ElevenLabs kan skicka binär PCM eller JSON med base64
+    if (isBinary) {
+      ws.send(JSON.stringify({ type: "media", media: { payload: bufToB64(data) } }));
+    } else {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.audio) {
+          ws.send(JSON.stringify({ type: "media", media: { payload: msg.audio } }));
+        }
+      } catch {
+        // ignorera icke-JSON
+      }
     }
   });
 
-  ws.on("close", () => { clearInterval(keepAlive); console.log("🔚 WS closed:", sessionId); });
-  ws.on("error", (e) => console.error("WS error:", e));
+  // Hantera Vonage ping/pong + stängning
+  ws.on("message", (raw) => {
+    try {
+      const m = JSON.parse(raw.toString());
+      if (m.type === "ping") ws.send(JSON.stringify({ type: "pong" }));
+      if (m.type === "stop" || m.type === "hangup") { try { ws.close(); } catch {} }
+    } catch {}
+  });
+
+  const clean = () => {
+    clearInterval(keepAlive);
+    try { ttsWS.close(); } catch {}
+  };
+  ws.on("close", clean);
+  ws.on("error", clean);
+  ttsWS.on("close", () => { try { ws.close(); } catch {} });
+  ttsWS.on("error", (e) => console.error("ElevenLabs WS error:", e));
 });
 
 server.listen(PORT, () => console.log(`🚀 Listening on :${PORT}`));
