@@ -1,23 +1,19 @@
-// server.js  (ESM – se till att package.json har: { "type": "module" })
+// server.js (ESM – package.json ska ha { "type": "module" })
 import express from "express";
-
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 10000;
-const CONNECTOR_WS_URI = process.env.CONNECTOR_WS_URI;              // wss://elevenlabs-agent-ws-connector-1.onrender.com/media
-const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID || "";  // t.ex. agent_8801k2ypbd8ae41acdw590tc5mgy
+const CONNECTOR_WS_URI = process.env.CONNECTOR_WS_URI;
+const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID || "";
 
-// Healthcheck
 app.get("/", (_req, res) => res.type("text/plain").send("OK - NCCO server is running"));
 
-// Vonage events (valfritt)
 app.post("/event", (req, res) => {
   try { console.log("📟 Vonage event:", JSON.stringify(req.body)); } catch {}
   res.sendStatus(200);
 });
 
-// *** VIKTIGT: NCCO som Vonage hämtar ***
 app.get("/ncco", (_req, res) => {
   if (!CONNECTOR_WS_URI) return res.status(500).json({ error: "CONNECTOR_WS_URI is not set" });
   res.json([
@@ -35,7 +31,6 @@ app.get("/ncco", (_req, res) => {
   ]);
 });
 
-// (alt. route om du vill använda /answer)
 app.get("/answer", (_req, res) => {
   if (!CONNECTOR_WS_URI) return res.status(500).json({ error: "CONNECTOR_WS_URI is not set" });
   res.json([
@@ -55,6 +50,6 @@ app.get("/answer", (_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`✅ NCCO server listening on :${PORT}`);
-  console.log(`   CONNECTOR_WS_URI      = ${CONNECTOR_WS_URI}`);
-  console.log(`   ELEVENLABS_AGENT_ID   = ${ELEVENLABS_AGENT_ID ? "[set]" : "(empty!)"}`);
+  console.log(`   CONNECTOR_WS_URI    = ${CONNECTOR_WS_URI}`);
+  console.log(`   ELEVENLABS_AGENT_ID = ${ELEVENLABS_AGENT_ID ? "[set]" : "(empty!)"}`);
 });
